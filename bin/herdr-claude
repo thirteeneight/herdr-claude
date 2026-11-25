@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Claude Code sessions in Herdr: prompt-cache status, Workwatch workstream, resume after terminal loss, tmux import.
+"""Claude Code sessions in Herdr: prompt-cache status, resume after terminal loss, tmux import, optional workstream label.
 
-  herdr-claude status [--json] [--track]   cache state and workstream of every live interactive Claude session
+  herdr-claude status [--json] [--track]   cache state (and workstream, when enabled) of every live interactive Claude session
   herdr-claude track                      remember which Herdr terminal holds which session; resume lost ones
   herdr-claude autocompact [--dry-run]    send /compact to idle sessions shortly before their cache expires (config-gated)
   herdr-claude autocompact-report         per send: resumed or not, minutes until resumed, context before and after
@@ -12,9 +12,10 @@ Profiles (CLAUDE_CONFIG_DIR) and their shell launchers come from HERDR_CLAUDE_PR
 else ~/.claude=claude.
 Autocompact is off unless ~/.config/herdr-claude/config.json has {"autocompact": {"enabled": true, "before_seconds": 120,
 "min_context_tokens": 200000}}. Optional test filters: "only_cwd_prefix", "only_session".
-Costs are Anthropic list-price estimates per million tokens, matching ww's price table.
+Costs are Anthropic list-price estimates per million tokens.
 
-A session's workstream is the one ww recorded it on (a claim, or any ww command it ran). Failing that,
+The workstream label is optional and off by default; {"workwatch": {"enabled": true}} in the config turns it on.
+A session's workstream is the one Workwatch (ww) recorded it on (a claim, or any ww command it ran). Failing that,
 it is inferred from the ticket keys the person and Claude wrote in the transcript (tool output and
 injected context excluded), when one workstream clearly leads.
 """
@@ -314,9 +315,18 @@ def mention_counts(path, cache):
     return rec["counts"]
 
 
+def workwatch_enabled():
+    """True only when the config has {"workwatch": {"enabled": true}} (missing or unreadable file = off)."""
+    try:
+        return (json.loads(CONFIG_FILE.read_text()).get("workwatch") or {}).get("enabled") is True
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return False
+
+
 def attach_workstreams(sessions):
     """Sets session["workstream"] to {id, name, status, how, keys} or None."""
-    board = ww_board()
+    # Needs Workwatch (ww), which is not public yet; opt in with "workwatch": {"enabled": true} in the config.
+    board = ww_board() if workwatch_enabled() else None
     if board is None:
         for s in sessions:
             s["workstream"] = None
