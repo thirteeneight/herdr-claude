@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""Claude Code sessions in Herdr: prompt-cache status, Workwatch workstream, resume after terminal loss, tmux import.
+
+  herdr-claude status [--json] [--track]   cache state and workstream of every live interactive Claude session
+  herdr-claude track                      remember which Herdr terminal holds which session; resume lost ones
+  herdr-claude autocompact [--dry-run]    send /compact to idle sessions shortly before their cache expires (config-gated)
+  herdr-claude autocompact-report         per send: resumed or not, minutes until resumed, context before and after
+  herdr-claude import-tmux [--apply] [--session NAME]...   rebuild tmux sessions as Herdr spaces
+
+Profiles (CLAUDE_CONFIG_DIR) and their shell launchers come from HERDR_CLAUDE_PROFILES
+("dir=launcher:dir=launcher"), else the config file's "profiles" ({"~/.claude-work": "work-claude"}),
+else ~/.claude=claude.
+Autocompact is off unless ~/.config/herdr-claude/config.json has {"autocompact": {"enabled": true, "before_seconds": 120,
+"min_context_tokens": 200000}}. Optional test filters: "only_cwd_prefix", "only_session".
+Costs are Anthropic list-price estimates per million tokens, matching ww's price table.
+
+A session's workstream is the one ww recorded it on (a claim, or any ww command it ran). Failing that,
+it is inferred from the ticket keys the person and Claude wrote in the transcript (tool output and
+injected context excluded), when one workstream clearly leads.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+STATE_FILE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "herdr-claude" / "sessions.json"
+RESURRECT_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "tmux" / "resurrect"
+if (HOME / ".tmux/resurrect").is_dir():
+    RESURRECT_DIR = HOME / ".tmux/resurrect"
+RESURRECT_SAVE = HOME / ".tmux/plugins/tmux-resurrect/scripts/save.sh"
+
+# (input, cache read) USD per million tokens; cache writes are 1.25x input (5m) or 2x input (1h).
+PRICES = {
+    "claude-fable-5-1": (10, 1), "claude-fable-5": (10, 1),
+    "claude-opus-5-5": (4, 0.2), "claude-opus-5": (5, 0.5), "claude-opus-4-8": (5, 0.5),
+    "claude-sonnet-5-5": (2, 0.2), "claude-sonnet-5": (2, 0.2), "claude-sonnet-4-6": (3, 0.3),
+    "claude-haiku-5-5": (0.1, 0.01), "claude-haiku-4-5": (1, 0.1),
+}
+LONG_PRICES = {"claude-haiku-5-5": (100_000, (0.5, 0.05))}  # prompt above N tokens uses the long tier
+DEFAULT_TTL = 3600  # Claude Code writes the main thread with the 1-hour cache lifetime
+RESUME_GRACE_S = 120  # don't resend a resume while the previous one may still be starting
+TAIL_STEPS = (1 << 20, 8 << 20, 64 << 20)
+MENTIONS_FILE = STATE_FILE.parent / "mentions.json"
+CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "herdr-claude" / "config.json"
+AUTOCOMPACT_STATE = STATE_FILE.parent / "autocompact.json"
+AUTOCOMPACT_LOG = STATE_FILE.parent / "autocompact.log"
+COMPACT_COOLDOWN_S = 600  # skip a session compacted this recently
+HC_SEND_TIMEOUT_S = 15  # hc send waits for a person's draft; never stall the sidebar call on it
+MENTIONS_FIRST_READ = 16 << 20  # a transcript seen for the first time is read from this far before its end
+INFER_MIN, INFER_LEAD = 3, 2  # inferred: at least 3 mentions and twice the runner-up
+KEY_BYTES = re.compile(rb"\b[A-Z][A-Z0-9]+-\d+\b")
+KEY_TEXT = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+# Command output and injected context echo boards and logs; only what someone wrote counts.
+NOT_PROSE = re.compile(r"<(system-reminder|bash-stdout|bash-stderr|local-command-stdout|local-command-stderr)>.*?</\1>", re.S)
+
+
+def profiles():
+    raw = os.environ.get("HERDR_CLAUDE_PROFILES")
+    if raw:
+        pairs = [item.split("=", 1) for item in raw.split(":") if "=" in item]
+        return {Path(os.path.expanduser(d)): launcher for d, launcher in pairs}
+    try:
+        configured = json.loads(CONFIG_FILE.read_text()).get("profiles") or {}
+    except (OSError, json.JSONDecodeError):
+        configured = {}
+    if configured:
+        return {Path(os.path.expanduser(d)): launcher for d, launcher in configured.items()}
+    return {HOME / ".claude": "claude"}
+
+
+def hc_bin():
+    return shutil.which("hc") or str(HOME / ".local/bin/hc")
+
+
+def core_running():
+    """True when a herdr-core server is up. Never starts one: a core started from an agent's
+    shell inherits that agent's environment (CLAUDE_CONFIG_DIR, TMUX, ...) and passes it on."""
+    # -a: macOS pgrep leaves out its own ancestors, and inside a Herdr terminal the core is one.
+    # Anchored so a command line that merely mentions it doesn't count.
+    return subprocess.run(["pgrep", "-a", "-qf", r"(^|/)herdr-core (serve|--hc-launchd)( |$)"]).returncode == 0
+
+
+def hc(*args, check=True):
+    if not core_running():
+        sys.exit("herdr-claude: herdr-core is not running; open Herdr first (it starts the core with a clean environment)")
+    # Sent from inside a Herdr terminal, hc tags text with its sender, which breaks typed commands.
+    env = {k: v for k, v in os.environ.items() if k != "HC_TERMINAL_ID"} if args[:1] == ("send",) else None
+    proc = subprocess.run([hc_bin(), *args], capture_output=True, text=True, env=env)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"hc {' '.join(args)}: {proc.stderr.strip() or proc.stdout.strip()}")
+    return proc
+
+
+def hc_json(*args):
+    proc = hc(*args, "--json", check=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+# ---------- live sessions ----------
+
+def process_table(pids):
+    """pid -> (start time as ps prints it, HC_TERMINAL_ID or None) for live pids."""
+    if not pids:
+        return {}
+    proc = subprocess.run(["ps", "eww", "-o", "pid=,lstart=,command=", "-p", ",".join(map(str, pids))],
+                          capture_output=True, text=True)
+    table = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+        pid, start, rest = int(parts[0]), " ".join(parts[1:6]), parts[6]
+        match = re.search(r"(?:^|\s)HC_TERMINAL_ID=(\S+)", rest)
+        table[pid] = (start, match.group(1) if match else None)
+    return table
+
+
+def same_start(ps_local, recorded):
+    """ps prints local time; Claude's procStart has been seen in UTC. Accept either reading."""
+    import calendar
+    fmt = "%a %b %d %H:%M:%S %Y"
+    try:
+        actual = time.mktime(time.strptime(ps_local, fmt))
+        parsed = time.strptime(recorded, fmt)
+    except ValueError:
+        return ps_local == recorded
+    return min(abs(actual - calendar.timegm(parsed)), abs(actual - time.mktime(parsed))) <= 1
+
+
+def live_sessions():
+    """Interactive Claude processes with a session file whose pid is still that process."""
+    found = []
+    for profile, launcher in profiles().items():
+        for path in (profile / "sessions").glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("kind", "interactive") != "interactive" or not data.get("sessionId") or not data.get("pid"):
+                continue
+            found.append({"profile": str(profile), "launcher": launcher, "pid": int(data["pid"]),
+                          "procStart": data.get("procStart"), "sessionId": data["sessionId"],
+                          "cwd": data.get("cwd", ""), "name": data.get("name"), "busy": data.get("status") == "busy"})
+    table = process_table([s["pid"] for s in found])
+    live = []
+    for s in found:
+        entry = table.get(s["pid"])
+        # The start time guards against a reused pid behind a stale session file.
+        if not entry or (s["procStart"] and not same_start(entry[0], s["procStart"])):
+            continue
+        s["terminal"] = entry[1]
+        live.append(s)
+    return live
+
+
+# ---------- transcripts ----------
+
+def transcript_for(profile, session_id):
+    matches = list((Path(profile) / "projects").glob(f"*/{session_id}.jsonl"))
+    return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+
+def main_requests(path, want=40):
+    """The latest main-thread assistant requests with usage, newest first."""
+    size = path.stat().st_size
+    for step in TAIL_STEPS:
+        start = max(0, size - step)
+        with path.open("rb") as handle:
+            handle.seek(start)
+            lines = handle.read().splitlines()
+        if start:
+            lines = lines[1:]  # partial first line
+        found = []
+        for raw in reversed(lines):
+            if b'"usage"' not in raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            message = entry.get("message") or {}
+            if entry.get("type") != "assistant" or entry.get("isSidechain") or not message.get("usage"):
+                continue
+            if message.get("model") in (None, "<synthetic>"):
+                continue
+            found.append(entry)
+            if len(found) >= want:
+                return found
+        if found or start == 0:
+            return found
+    return []
+
+
+def model_key(model):
+    base = re.sub(r"\[.*\]$", "", model or "")
+    return max((k for k in PRICES if base.startswith(k)), key=len, default=None)
+
+
+def costs(model, ctx, ttl):
+    key = model_key(model)
+    if not key:
+        return None, None
+    inp, read = PRICES[key]
+    if key in LONG_PRICES and ctx > LONG_PRICES[key][0]:
+        inp, read = LONG_PRICES[key][1]
+    write = 2.0 if ttl >= 3600 else 1.25
+    return ctx * read / 1e6, ctx * inp * write / 1e6
+
+
+def iso_ms(stamp):
+    from datetime import datetime
+    return int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() * 1000)
+
+
+def cache_state(session, now_ms):
+    path = transcript_for(session["profile"], session["sessionId"])
+    requests = main_requests(path) if path else []
+    out = {k: session[k] for k in ("terminal", "profile", "sessionId", "cwd", "name", "busy", "pid")}
+    out["transcript"] = str(path) if path else None
+    if not requests:
+        out.update(state="new", model=None, ctx=0, lastAt=None, ttl=None, expiresAt=None, warmCost=0, coldCost=0)
+        return out
+    last = requests[0]
+    usage = last["message"]["usage"]
+    created = usage.get("cache_creation") or {}
+    ctx = (usage.get("input_tokens") or 0) + (usage.get("cache_read_input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0)
+    wrote_1h = any(((r["message"]["usage"].get("cache_creation") or {}).get("ephemeral_1h_input_tokens") or 0) > 0 for r in requests)
+    wrote_5m = any(((r["message"]["usage"].get("cache_creation") or {}).get("ephemeral_5m_input_tokens") or 0) > 0 for r in requests)
+    ttl = 3600 if wrote_1h else 300 if wrote_5m else DEFAULT_TTL
+    last_ms = iso_ms(last["timestamp"])
+    expires = last_ms + ttl * 1000
+    warm, cold = costs(last["message"]["model"], ctx, ttl)
+    if session["busy"]:
+        state = "working"
+    elif now_ms < expires:
+        state = "warm"
+    else:
+        state = "cold"
+    out.update(state=state, model=last["message"]["model"], ctx=ctx, lastAt=last_ms, ttl=ttl, expiresAt=expires,
+               warmCost=warm, coldCost=cold, lastWrite1h=created.get("ephemeral_1h_input_tokens") or 0)
+    return out
+
+
+# ---------- workstreams (Workwatch) ----------
+
+def ww_board():
+    """Active workstreams from `ww ls`, or None when ww is missing or fails."""
+    # Herdr runs this with launchd's PATH, where neither ww nor the node it needs is found.
+    extra = [str(HOME / ".local/bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    path = os.pathsep.join(extra + [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p not in extra])
+    exe = shutil.which("ww", path=path)
+    if not exe:
+        return None
+    try:
+        proc = subprocess.run([exe, "ls", "--json", "--offline"], capture_output=True, text=True, timeout=15,
+                              env={**os.environ, "PATH": path})
+        return json.loads(proc.stdout)["workstreams"] if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def prose(entry):
+    """Text the person typed or Claude wrote in one transcript entry."""
+    if entry.get("isSidechain") or entry.get("isMeta") or entry.get("toolUseResult") is not None:
+        return
+    content = (entry.get("message") or {}).get("content")
+    if entry.get("type") == "user" and isinstance(content, str):
+        yield NOT_PROSE.sub("", content)
+    elif entry.get("type") in ("user", "assistant") and isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                yield NOT_PROSE.sub("", block.get("text") or "")
+
+
+def mention_counts(path, cache):
+    """Ticket-key counts in a transcript's prose. Reads only what was appended since the last call."""
+    st = path.stat()
+    rec = cache.get(str(path))
+    if not rec or rec.get("ino") != st.st_ino or st.st_size < rec.get("offset", 0):
+        start = max(0, st.st_size - MENTIONS_FIRST_READ)
+        rec = {"ino": st.st_ino, "offset": start, "partial": start > 0, "counts": {}}
+    if st.st_size > rec["offset"]:
+        with path.open("rb") as handle:
+            handle.seek(rec["offset"])
+            data = handle.read(st.st_size - rec["offset"])
+        end = data.rfind(b"\n") + 1  # whole lines only; a line being written waits for the next call
+        if end:
+            lines = data[:end].split(b"\n")
+            if rec.pop("partial", False):
+                lines = lines[1:]
+            for raw in lines:
+                if not KEY_BYTES.search(raw):
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                for text in prose(entry):
+                    for key in KEY_TEXT.findall(text):
+                        rec["counts"][key] = rec["counts"].get(key, 0) + 1
+            rec["offset"] += end
+    cache[str(path)] = rec
+    return rec["counts"]
+
+
+def attach_workstreams(sessions):
+    """Sets session["workstream"] to {id, name, status, how, keys} or None."""
+    board = ww_board()
+    if board is None:
+        for s in sessions:
+            s["workstream"] = None
+        return
+    owner = {}  # ticket or epic key -> workstream
+    recorded = {}  # session id -> (sort stamp, workstream, how)
+    for w in board:
+        epics = [e if isinstance(e, str) else (e or {}).get("key") for e in w.get("epics") or []]
+        for key in [w.get("jira"), *(w.get("tickets") or []), *epics]:
+            if key:
+                owner[key] = w
+        for rec in w.get("sessions") or []:
+            stamp = rec.get("lastSeenAt") or rec.get("startedAt") or ""
+            if rec.get("id") and stamp >= recorded.get(rec["id"], ("",))[0]:
+                recorded[rec["id"]] = (stamp, w, "recorded")
+        claimer = ((w.get("claim") or {}).get("session") or {}).get("id")
+        if claimer:
+            recorded[claimer] = ("￿", w, "claimed")  # a claim outranks any recorded session
+    try:
+        cache = json.loads(MENTIONS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+    fresh = {}
+    for s in sessions:
+        s["workstream"] = None
+        if s["sessionId"] in recorded:
+            _, w, how = recorded[s["sessionId"]]
+            s["workstream"] = {"id": w["id"], "name": w.get("name", ""), "status": w.get("status"), "how": how, "keys": []}
+            continue
+        if not s.get("transcript"):
+            continue
+        try:
+            counts = mention_counts(Path(s["transcript"]), cache)
+        except OSError:
+            continue
+        fresh[s["transcript"]] = cache[s["transcript"]]
+        tally, keys = {}, {}
+        for key, n in counts.items():
+            if key in owner:
+                wid = owner[key]["id"]
+                tally[wid] = tally.get(wid, 0) + n
+                keys.setdefault(wid, []).append([key, n])
+        ranked = sorted(tally.items(), key=lambda kv: -kv[1])
+        if not ranked or ranked[0][1] < INFER_MIN or (len(ranked) > 1 and ranked[0][1] < INFER_LEAD * ranked[1][1]):
+            continue
+        w = next(w for w in board if w["id"] == ranked[0][0])
+        top = sorted(keys[w["id"]], key=lambda kn: -kn[1])[:3]
+        s["workstream"] = {"id": w["id"], "name": w.get("name", ""), "status": w.get("status"), "how": "inferred", "keys": top}
+    # Only live transcripts stay cached.
+    MENTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MENTIONS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(fresh))
+    tmp.replace(MENTIONS_FILE)
+
+
+# ---------- state: terminal -> session, for resume after loss ----------
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"terminals": {}}
+
+
+def save_state(state):
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
+
+
+def resume_command(entry):
+    launcher = profiles().get(Path(entry["profile"])) or f"CLAUDE_CONFIG_DIR={sh_quote(entry['profile'])} claude"
+    return f"cd {sh_quote(entry['cwd'] or str(HOME))} && {launcher} --resume {entry['sessionId']}"
+
+
+def sh_quote(text):
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
+def track(live):
+    """Record Herdr terminals' sessions; resume a session whose terminal lost its program.
+
+    A lost terminal (core crash, reboot) comes back with the same address and a new shell pid.
+    A Claude that exited while its shell lived keeps the pid: that was the person's choice.
+    """
+    state = load_state()
+    terms = state.setdefault("terminals", {})
+    now = time.time()
+    events = []
+    in_herdr = {s["terminal"]: s for s in live if s["terminal"]}
+    live_ids = {s["sessionId"] for s in live}
+    for addr, s in in_herdr.items():
+        old = terms.get(addr)
+        if old and old.get("sessionId") == s["sessionId"] and old.get("pid"):
+            continue
+        info = hc_json("get", addr) or {}
+        terms[addr] = {"profile": s["profile"], "sessionId": s["sessionId"], "cwd": s["cwd"],
+                       "pid": info.get("pid"), "savedAt": int(now)}
+    for addr in list(terms):
+        if addr in in_herdr:
+            continue
+        entry = terms[addr]
+        info = hc_json("get", addr)
+        if not info or info.get("state") != "live":
+            del terms[addr]
+            events.append({"terminal": addr, "event": "forgotten", "reason": "terminal gone"})
+            continue
+        pending = entry.get("pending")
+        if not pending and info.get("pid") == entry.get("pid"):
+            del terms[addr]
+            events.append({"terminal": addr, "event": "forgotten", "reason": "Claude exited in a live shell"})
+            continue
+        if now - entry.get("resumedAt", 0) < RESUME_GRACE_S:
+            continue
+        if entry["sessionId"] in live_ids:
+            continue  # still open elsewhere (tmux during migration): wait until it closes
+        hc("send", addr, resume_command(entry))
+        entry.update(resumedAt=int(now), pending=False, pid=info.get("pid"))
+        events.append({"terminal": addr, "event": "resumed", "sessionId": entry["sessionId"]})
+    save_state(state)
+    return events
+
+
+# ---------- autocompact ----------
+
+def autocompact_config():
+    """The autocompact settings when enabled, else None (missing or unreadable file = off)."""
+    try:
+        cfg = (json.loads(CONFIG_FILE.read_text()).get("autocompact") or {})
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    if cfg.get("enabled") is not True:
+        return None
+    return {"before_seconds": int(cfg.get("before_seconds", 120)), "min_context_tokens": int(cfg.get("min_context_tokens", 200000)),
+            "only_cwd_prefix": cfg.get("only_cwd_prefix"), "only_session": cfg.get("only_session")}
+
+
+DIALOG_MARKERS = ("do you want", "esc to cancel", "enter to confirm", "enter to select", "esc to interrupt", "(y/n)", "[y/n]", "❯ 1.", "press enter")
+
+
+def prompt_state(screen):
+    """(True, "") when Claude's input box is on screen with an empty line and no dialog, else (False, reason)."""
+    lines = [l.rstrip() for l in screen.splitlines()]
+    low = screen.lower()
+    for marker in DIALOG_MARKERS:
+        if marker in low:
+            return False, f"dialog or busy marker on screen: {marker!r}"
+    rules = [i for i, l in enumerate(lines) if len(l.strip()) >= 10 and set(l.strip()) == {"─"}]
+    if len(rules) < 2:
+        return False, "input box not found"
+    top, bottom = rules[-2], rules[-1]
+    box = [l.replace("\xa0", " ").strip() for l in lines[top + 1:bottom]]
+    if len(box) != 1 or not box[0].startswith("❯"):
+        return False, "input box not found"
+    if box[0][1:].strip():
+        return False, "input not empty"
+    return True, ""
+
+
+def recently_compacted(transcript, now_ms):
+    """True when the transcript tail holds a compact boundary or summary newer than the cooldown."""
+    if not transcript:
+        return False
+    path = Path(transcript)
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - (4 << 20)))
+            lines = handle.read().splitlines()
+    except OSError:
+        return False
+    for raw in reversed(lines):
+        if b"compact_boundary" not in raw and b'"isCompactSummary"' not in raw:
+            continue
+        try:
+            entry = json.loads(raw)
+            if entry.get("subtype") == "compact_boundary" or entry.get("isCompactSummary"):
+                return now_ms - iso_ms(entry["timestamp"]) < COMPACT_COOLDOWN_S * 1000
+        except (json.JSONDecodeError, KeyError, ValueError):
+            continue
+    return False
+
+
+def autocompact_decide(s, cfg, state, now_ms):
+    """(action, reason) for one session. action is send, skip or none (not in the window: nothing to report)."""
+    left = (s.get("expiresAt") or 0) - now_ms
+    if cfg.get("only_session") and s["sessionId"] != cfg["only_session"]:
+        return "none", "filtered out"
+    if cfg.get("only_cwd_prefix") and not (s.get("cwd") or "").startswith(cfg["only_cwd_prefix"]):
+        return "none", "filtered out"
+    if not s.get("terminal"):
+        return "none", "not in a Herdr terminal"
+    if s["state"] != "warm":
+        return "none", f"state {s['state']}"
+    if not 0 < left <= cfg["before_seconds"] * 1000:
+        return "none", "outside window"
+    if s["ctx"] < cfg["min_context_tokens"]:
+        return "none", "context below minimum"
+    if f"{s['sessionId']}:{round(s['expiresAt'] / 60000)}" in state.get("sent", {}):
+        return "none", "already sent in this cache window"
+    term = hc_json("get", s["terminal"])
+    if not term:
+        return "skip", "hc cannot read terminal"
+    fg = term.get("foreground") or {}
+    status = term.get("status") or {}
+    if term.get("state") != "live" or status.get("app") != "claude-code" or fg.get("pid") != s["pid"]:
+        return "skip", "terminal does not hold this Claude process"
+    if status.get("state") not in ("idle", "done"):
+        return "skip", f"agent status {status.get('state')!r}"
+    if recently_compacted(s.get("transcript"), now_ms):
+        return "skip", "compacted recently"
+    proc = hc("read", s["terminal"], "--json", check=False)
+    try:
+        screen = json.loads(proc.stdout)["text"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return "skip", "screen unreadable"
+    ok, reason = prompt_state(screen)
+    return ("send", "idle, empty prompt, cache expiring") if ok else ("skip", reason)
+
+
+def autocompact(sessions, dry_run=False):
+    """Decisions for every session; sends /compact where all checks hold. Never raises."""
+    decisions = []
+    try:
+        cfg = autocompact_config()
+        if cfg is None:
+            return [{"action": "disabled", "reason": "autocompact is off"}] if dry_run else []
+        now_ms = int(time.time() * 1000)
+        try:
+            state = json.loads(AUTOCOMPACT_STATE.read_text())
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        state.setdefault("sent", {})
+        state.setdefault("skipped", {})
+        for s in sessions:
+            d = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "sessionId": s["sessionId"], "terminal": s.get("terminal"),
+                 "ctx": s["ctx"], "secondsLeft": round(((s.get("expiresAt") or now_ms) - now_ms) / 1000)}
+            try:
+                action, reason = autocompact_decide(s, cfg, state, now_ms)
+                if action == "send" and not dry_run:
+                    # Same checks held a moment ago; a person's draft would make hc wait, so bound it.
+                    # Without HC_TERMINAL_ID hc doesn't tag the text with its sender, which would break the slash command.
+                    env = {k: v for k, v in os.environ.items() if k != "HC_TERMINAL_ID"}
+                    proc = subprocess.run([hc_bin(), "send", s["terminal"], "/compact"], capture_output=True, text=True,
+                                          timeout=HC_SEND_TIMEOUT_S, env=env)
+                    if proc.returncode != 0:
+                        action, reason = "skip", f"hc send failed: {(proc.stderr or proc.stdout).strip()[:200]}"
+                    else:
+                        state["sent"][f"{s['sessionId']}:{round(s['expiresAt'] / 60000)}"] = int(now_ms / 1000)
+            except (Exception, SystemExit) as e:
+                action, reason = "skip", f"error: {e}"
+            d.update(action=action, reason=reason)
+            if action != "none":
+                key = f"{s['sessionId']}:{round((s.get('expiresAt') or 0) / 60000)}:{reason}"
+                new_skip = action == "skip" and key not in state["skipped"]
+                if not dry_run and (action == "send" or new_skip):
+                    if new_skip:
+                        state["skipped"][key] = int(now_ms / 1000)
+                    AUTOCOMPACT_LOG.parent.mkdir(parents=True, exist_ok=True)
+                    with AUTOCOMPACT_LOG.open("a") as log:
+                        log.write(json.dumps(d) + "\n")
+            if action != "none" or dry_run:
+                s["autocompact"] = {"action": action, "reason": reason}
+            decisions.append(d)
+        if not dry_run:
+            cutoff = now_ms / 1000 - 7 * 86400
+            for bucket in ("sent", "skipped"):
+                state[bucket] = {k: v for k, v in state[bucket].items() if v > cutoff}
+            AUTOCOMPACT_STATE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = AUTOCOMPACT_STATE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, indent=2))
+            tmp.replace(AUTOCOMPACT_STATE)
+    except (Exception, SystemExit) as e:
+        print(f"herdr-claude: autocompact: {e}", file=sys.stderr)
+        try:
+            AUTOCOMPACT_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with AUTOCOMPACT_LOG.open("a") as log:
+                log.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "action": "error", "reason": str(e)}) + "\n")
+        except OSError:
+            pass
+    return decisions
+
+
+# ---------- commands ----------
+
+def fmt_age(ms):
+    m = int(ms // 60000)
+    return f"{m}m" if m < 60 else f"{m // 60}h" if m < 1440 else f"{m // 1440}d"
+
+
+def fmt_cost(value):
+    return "?" if value is None else f"${value:.2f}"
+
+
+def cmd_status(args):
+    now_ms = int(time.time() * 1000)
+    live = live_sessions()
+    sessions = [cache_state(s, now_ms) for s in live]
+    try:
+        attach_workstreams(sessions)
+    except Exception as e:  # the cache line matters more than the workstream label
+        for s in sessions:
+            s.setdefault("workstream", None)
+        print(f"herdr-claude: workstreams: {e}", file=sys.stderr)
+    events = track(live) if args.track else []
+    if args.track:
+        autocompact(sessions)
+    if args.json:
+        print(json.dumps({"now": now_ms, "sessions": sessions, "events": events}))
+        return
+    order = {"working": 0, "warm": 1, "cold": 2, "new": 3}
+    for s in sorted(sessions, key=lambda s: (order[s["state"]], s.get("expiresAt") or 0)):
+        left = ""
+        if s["state"] == "warm":
+            left = f"{fmt_age(s['expiresAt'] - now_ms)} left"
+        elif s["state"] == "cold":
+            left = f"cold {fmt_age(now_ms - s['expiresAt'])}"
+        where = s["terminal"] or "tmux/other"
+        ws = s.get("workstream")
+        ws_label = (ws["id"] + ("?" if ws["how"] == "inferred" else "")) if ws else "-"
+        print(f"{where:<10} {s['state']:<8} {left:<12} ctx {s['ctx'] // 1000:>4}k  "
+              f"next turn {fmt_cost(s['warmCost'])} warm / {fmt_cost(s['coldCost'])} cold  "
+              f"{(s['model'] or '-').replace('claude-', ''):<12} {ws_label:<7} {Path(s['cwd']).name}")
+    for e in events:
+        print(f"{e['terminal']}: {e['event']} {e.get('reason', e.get('sessionId', ''))}")
+
+
+def cmd_track(_args):
+    for e in track(live_sessions()):
+        print(json.dumps(e))
+
+
+def cmd_autocompact(args):
+    now_ms = int(time.time() * 1000)
+    sessions = [cache_state(s, now_ms) for s in live_sessions()]
+    for d in autocompact(sessions, dry_run=args.dry_run):
+        print(json.dumps(d))
+
+
+def is_typed_prompt(row):
+    """A message the person typed, not a compact summary, command echo or tool result."""
+    if row.get("type") != "user" or row.get("isMeta") or row.get("isCompactSummary"):
+        return False
+    content = row.get("message", {}).get("content")
+    if isinstance(content, list):
+        if any(b.get("type") == "tool_result" for b in content if isinstance(b, dict)):
+            return False
+        content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    text = (content or "").lstrip()
+    return bool(text) and not text.startswith(("<command-", "<local-command", "Caveat:"))
+
+
+def compact_outcome(session_id, sent_ms):
+    """What followed an autocompact send: context before and after, and when the person came back."""
+    paths = [p for prof in profiles() for p in (prof / "projects").glob(f"*/{session_id}.jsonl")]
+    if not paths:
+        return {"outcome": "transcript missing"}
+    rows = [json.loads(l) for l in max(paths, key=lambda p: p.stat().st_mtime).read_text().splitlines() if l.strip()]
+    stamped = [(iso_ms(r["timestamp"]), r) for r in rows if r.get("timestamp")]
+    boundary = next(((t, r) for t, r in stamped if t >= sent_ms and r.get("subtype") == "compact_boundary"), None)
+    if not boundary:
+        return {"outcome": "no compact"}
+    after = [(t, r) for t, r in stamped if t > boundary[0]]
+    out = {"preCtx": (boundary[1].get("compactMetadata") or {}).get("preTokens")}
+    used = next((r["message"]["usage"] for _, r in after if r.get("type") == "assistant" and r.get("message", {}).get("usage")), None)
+    if used:
+        out["postCtx"] = sum(used.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    back = next((t for t, r in after if is_typed_prompt(r)), None)
+    if back is None:
+        out["outcome"] = "not resumed"
+    else:
+        out.update(outcome="resumed", resumedAfterMin=round((back - boundary[0]) / 60000))
+    return out
+
+
+def cmd_report(args):
+    from datetime import datetime
+    try:
+        lines = AUTOCOMPACT_LOG.read_text().splitlines()
+    except OSError:
+        lines = []
+    sends = [d for d in map(json.loads, filter(None, lines)) if d.get("action") == "send"]
+    counts = {}
+    for d in sends:
+        sent_ms = int(datetime.strptime(d["ts"], "%Y-%m-%dT%H:%M:%S%z").timestamp() * 1000)
+        o = compact_outcome(d["sessionId"], sent_ms)
+        counts[o["outcome"]] = counts.get(o["outcome"], 0) + 1
+        print(json.dumps({"ts": d["ts"], "sessionId": d["sessionId"], **o}))
+    print(json.dumps({"sends": len(sends), **counts}))
+
+
+# ---------- tmux import ----------
+
+def read_resurrect():
+    last = RESURRECT_DIR / "last"
+    windows, panes = {}, []
+    for line in last.read_text().splitlines():
+        f = line.split("\t")
+        if f[0] == "window":
+            windows[(f[1], int(f[2]))] = {"session": f[1], "index": int(f[2]), "name": f[3][1:],
+                                          "named": f[7] == "off", "layout": json.loads(f[6])["L"]}
+        elif f[0] == "pane":
+            panes.append({"session": f[1], "window": int(f[2]), "index": int(f[5]), "cwd": f[7][1:],
+                          "command": f[9], "full": f[10][1:] if len(f) > 10 else ""})
+    claude = {}
+    tsv = RESURRECT_DIR / "claude-sessions.tsv"
+    if tsv.exists():
+        for line in tsv.read_text().splitlines():
+            target, profile, sid, cwd = (line.split("\t") + ["", "", "", ""])[:4]
+            claude[target] = {"profile": profile, "sessionId": sid, "cwd": cwd}
+    return windows, panes, claude
+
+
+def leaves(node):
+    if node["t"] == "p":
+        return [node]
+    return [leaf for child in node["c"] for leaf in leaves(child)]
+
+
+def herdr_do(command, payload):
+    proc = subprocess.run([shutil.which("herdr-app") or str(HOME / ".local/bin/herdr-app"), "do", command, json.dumps(payload)],
+                          capture_output=True, text=True)
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        out = {"error": proc.stderr.strip() or proc.stdout.strip()}
+    if proc.returncode != 0 or "error" in out:
+        raise RuntimeError(f"{command}: {out.get('error')}")
+    return out
+
+
+def herdr_pane_of(terminal):
+    proc = subprocess.run([shutil.which("herdr-app") or str(HOME / ".local/bin/herdr-app"), "ls"], capture_output=True, text=True)
+    for space in json.loads(proc.stdout)["spaces"]:
+        for tab in space["tabs"]:
+            for t in tab["terminals"]:
+                if t["terminal"] == terminal:
+                    return t["pane"]
+    raise RuntimeError(f"no pane for {terminal}")
+
+
+def cmd_import(args):
+    if not core_running():
+        sys.exit("herdr-claude: open Herdr first")
+    tmux_up = subprocess.run(["tmux", "has-session"], capture_output=True).returncode == 0
+    if tmux_up and RESURRECT_SAVE.exists():
+        # Fresh save (runs the Claude hook too). From the tmux server, not this process: macOS pgrep
+        # leaves out its own ancestors, so a save run from inside a Claude pane misses that pane.
+        subprocess.run(["tmux", "run-shell", f"{RESURRECT_SAVE} quiet"], capture_output=True)
+    windows, panes, claude = read_resurrect()
+    live_ids = {s["sessionId"] for s in live_sessions()}
+    by_id = {}
+    for p in panes:
+        by_id[(p["session"], p["window"], p["index"])] = p
+    sessions = []
+    for (sess, _idx), w in sorted(windows.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        if args.session and sess not in args.session:
+            continue
+        if not sessions or sessions[-1]["name"] != sess:
+            sessions.append({"name": sess, "windows": []})
+        sessions[-1]["windows"].append(w)
+
+    def pane_plan(sess, win, leaf):
+        p = by_id.get((sess, win, leaf["i"]), {"cwd": str(HOME), "command": "", "full": ""})
+        c = claude.get(f"{sess}:{win}.{leaf['i']}")
+        plan = {"cwd": (c or p)["cwd"] or str(HOME), "argv": None, "claude": c, "live": False, "was": p["command"]}
+        if c:
+            plan["live"] = c["sessionId"] in live_ids
+            if not plan["live"]:
+                launcher = profiles().get(Path(c["profile"]), "claude")
+                plan["argv"] = [launcher, "--resume", c["sessionId"]]
+        return plan
+
+    pending = []
+    for sess in sessions:
+        space_name = None if sess["name"].isdigit() else sess["name"]
+        print(f"space {space_name or '(named after its repo)'}  <- tmux session {sess['name']}")
+        space_id = None
+        for w in sess["windows"]:
+            tab_name = w["name"] if w["named"] else None
+            print(f"  tab {tab_name or '(numbered)'}")
+            first = leaves(w["layout"])[0]
+            plan = pane_plan(sess["name"], w["index"], first)
+
+            def describe(pl):
+                if pl["claude"]:
+                    tag = "LIVE in tmux, resumes once it exits there" if pl["live"] else "resume"
+                    return f"claude {tag} {pl['claude']['sessionId'][:8]} ({Path(pl['claude']['profile']).name}) in {pl['cwd']}"
+                return f"shell in {pl['cwd']}" + (f" (was {pl['was']})" if pl["was"] not in ("zsh", "bash", "") else "")
+
+            if args.apply:
+                payload = {k: v for k, v in {"folder": plan["cwd"], "argv": plan["argv"]}.items() if v}
+                if space_id is None:
+                    made = herdr_do("space.new", {**payload, **({"name": space_name} if space_name else {})})
+                    space_id = made["space"]
+                    if tab_name:
+                        herdr_do("tab.rename", {"id": made["tab"], "name": tab_name})
+                else:
+                    made = herdr_do("tab.new", {**payload, "space": space_id, **({"name": tab_name} if tab_name else {})})
+                root = {"pane": herdr_pane_of(made["terminal"]), "terminal": made["terminal"]}
+                if plan["live"]:
+                    pending.append((made["terminal"], plan["claude"]))
+            print(f"    {describe(plan)}")
+
+            def build(node, slot):
+                if node["t"] == "p":
+                    return
+                slots = [slot]
+                for child in node["c"][1:]:
+                    leaf = leaves(child)[0]
+                    pl = pane_plan(sess["name"], w["index"], leaf)
+                    print(f"    split {'right' if node['t'] == 'h' else 'down'}: {describe(pl)}")
+                    if args.apply:
+                        herdr_do("pane.focus", {"pane": slots[-1]["pane"]})
+                        payload = {"place": "right" if node["t"] == "h" else "down", "folder": pl["cwd"]}
+                        if pl["argv"]:
+                            payload["argv"] = pl["argv"]
+                        made = herdr_do("terminal.open", payload)
+                        new = {"pane": made.get("pane") or herdr_pane_of(made["terminal"]), "terminal": made["terminal"]}
+                        if pl["live"]:
+                            pending.append((made["terminal"], pl["claude"]))
+                        slots.append(new)
+                    else:
+                        slots.append(None)
+                for child, s in zip(node["c"], slots):
+                    build(child, s)
+
+            build(w["layout"], root if args.apply else None)
+    if args.apply and pending:
+        state = load_state()
+        for terminal, c in pending:
+            state["terminals"][terminal] = {"profile": c["profile"], "sessionId": c["sessionId"], "cwd": c["cwd"],
+                                            "pid": None, "pending": True, "savedAt": int(time.time())}
+        save_state(state)
+        print(f"\n{len(pending)} sessions are still open in tmux. Each resumes in Herdr within a minute of exiting it there.")
+    if not args.apply:
+        print("\nDry run. Run with --apply to create these in Herdr.")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="herdr-claude", description=__doc__.splitlines()[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("status", help="cache state of live Claude sessions")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--track", action="store_true", help="also record terminals and resume lost sessions")
+    p.set_defaults(func=cmd_status)
+    p = sub.add_parser("track", help="record terminals and resume lost sessions")
+    p.set_defaults(func=cmd_track)
+    p = sub.add_parser("autocompact", help="send /compact to idle sessions shortly before their cache expires")
+    p.add_argument("--dry-run", action="store_true", help="print decisions; send and record nothing")
+    p.set_defaults(func=cmd_autocompact)
+    p = sub.add_parser("autocompact-report", help="whether autocompacted sessions were resumed, and their context before and after")
+    p.set_defaults(func=cmd_report)
+    p = sub.add_parser("import-tmux", help="rebuild tmux sessions (from tmux-resurrect) as Herdr spaces")
+    p.add_argument("--apply", action="store_true")
+    p.add_argument("--session", action="append", help="only this tmux session (repeatable)")
+    p.set_defaults(func=cmd_import)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

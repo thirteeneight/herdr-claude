@@ -1,0 +1,7 @@
+{
+  "autocompact": {
+    "enabled": true,
+    "before_seconds": 120,
+    "min_context_tokens": 200000
+  }
+}

@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Rearrange the panes of the tab Herdr shows, like tmux's next-layout (prefix Space).
+
+  herdr-layout next | prev | side-by-side | stacked | main-left | main-top | grid
+
+Herdr has no layout command, so this takes every terminal but the first out of its pane
+(terminal.park: the program keeps running) and puts each back as a split (terminal.keep).
+A split halves the pane it splits, so groups are split in halves: even for 2 or 4 panes,
+as close as halving gets otherwise. Programs, addresses and scrollback are untouched.
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+
+LAYOUTS = ["side-by-side", "stacked", "main-left", "main-top", "grid"]
+STATE = os.path.expanduser("~/.local/state/herdr-layout.json")
+
+
+def app(*args):
+    r = subprocess.run(["herdr-app", *args], capture_output=True, text=True)
+    out = r.stdout.strip()
+    try:
+        data = json.loads(out) if out else {}
+    except json.JSONDecodeError:
+        data = {}
+    if r.returncode != 0 or (isinstance(data, dict) and data.get("error")):
+        sys.exit(f"herdr-layout: herdr-app {' '.join(args[:2])}: {data.get('error') if isinstance(data, dict) else ''} {r.stderr.strip()}".strip())
+    return data
+
+
+def tab_panes(tab_id):
+    """[(terminal, pane)] of a tab, in Herdr's order, or None."""
+    for s in app("ls")["spaces"]:
+        for t in s["tabs"]:
+            if t["id"] == tab_id:
+                return [(x["terminal"], x["pane"]) for x in t["terminals"]]
+    return None
+
+
+def tab_terminals(tab_id):
+    panes = tab_panes(tab_id)
+    return None if panes is None else [t for t, _ in panes]
+
+
+def wait(tab_id, check, what):
+    # park and keep reply "pending" and apply a moment later
+    for _ in range(60):
+        ts = tab_terminals(tab_id) or []
+        if check(ts):
+            return ts
+        time.sleep(0.05)
+    raise RuntimeError(f"timed out waiting for {what}")
+
+
+def halves(group, direction, ops):
+    """Split group[0]'s area among the group, in halves: (target, new, direction) steps."""
+    if len(group) < 2:
+        return
+    h = math.ceil(len(group) / 2)
+    left, right = group[:h], group[h:]
+    ops.append((left[0], right[0], direction))
+    halves(left, direction, ops)
+    halves(right, direction, ops)
+
+
+def plan(name, ts):
+    ops = []
+    if name == "side-by-side":
+        halves(ts, "right", ops)
+    elif name == "stacked":
+        halves(ts, "down", ops)
+    elif name in ("main-left", "main-top"):
+        main, rest = ts[0], ts[1:]
+        ops.append((main, rest[0], "right" if name == "main-left" else "down"))
+        halves(rest, "down" if name == "main-left" else "right", ops)
+    elif name == "grid":
+        cols = math.ceil(math.sqrt(len(ts)))
+        rows = [ts[i:i + cols] for i in range(0, len(ts), cols)]
+        halves([r[0] for r in rows], "down", ops)
+        for r in rows:
+            halves(r, "right", ops)
+    return ops
+
+
+def choices(n):
+    # With 2 panes the main and grid layouts look like the even ones.
+    return LAYOUTS[:2] if n == 2 else LAYOUTS
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else "next"
+    if arg in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    status = app("status")
+    tab_id = status.get("tab")
+    ts = tab_terminals(tab_id) if tab_id else None
+    if not ts or len(ts) < 2:
+        print("only one pane")
+        return
+    names = choices(len(ts))
+    state = load_state()
+    cur = state.get(tab_id)
+    if arg in ("next", "prev"):
+        i = names.index(cur) if cur in names else (-1 if arg == "next" else 0)
+        name = names[(i + (1 if arg == "next" else -1)) % len(names)]
+    elif arg in LAYOUTS:
+        name = arg
+    else:
+        sys.exit(f"herdr-layout: unknown layout {arg!r} (next, prev, {', '.join(LAYOUTS)})")
+
+    focused = next((t for t, p in tab_panes(tab_id) if p == status.get("focused_pane")), None)
+    ops = plan(name, ts)
+    parked = list(ts[1:])
+    try:
+        for t in parked:
+            app("do", "terminal.park", "--terminal", t)
+        wait(tab_id, lambda cur: cur == ts[:1], "panes to empty")
+        for target, new, direction in ops:
+            app("do", "pane.focus", "--terminal", target)
+            app("do", "terminal.keep", "--terminal", new, "--place", direction)
+            wait(tab_id, lambda cur, new=new: new in cur, f"{new} to get a pane")
+            parked.remove(new)
+    finally:
+        # Never leave a terminal without a pane: put any left over back beside the first.
+        for t in parked:
+            subprocess.run(["herdr-app", "do", "pane.focus", "--terminal", ts[0]], capture_output=True)
+            subprocess.run(["herdr-app", "do", "terminal.keep", "--terminal", t, "--place", "right"], capture_output=True)
+    if focused:
+        app("do", "pane.focus", "--terminal", focused)
+    state[tab_id] = name
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(state, f)
+    print(name)
+
+
+if __name__ == "__main__":
+    main()
