@@ -1,4 +1,0 @@
-# No CI workflows: readiness comes from the gate's own checks.
-no_ci: true
-commands:
-  lint: "python3 -m py_compile bin/herdr-claude bin/herdr-layout && bash -n install.sh"
