@@ -131,4 +131,7 @@ Sends and skips are logged as JSON lines in `~/.local/state/herdr-claude/autocom
 | `herdr-app/layouts/main-cache.json` | `~/.config/herdr-app/layouts/` |
 | `config/autocompact.json` | `~/.config/herdr-claude/config.json` (with `--autocompact`) |
 
-`herdr-app/` is derived from Herdr's bundled agents mod and main layout, licensed under Apache-2.0; see `herdr-app/LICENSE-herdr`.
+## License
+
+MIT, see `LICENSE`.
+`herdr-app/` is derived from Herdr's bundled agents mod and main layout and stays under Apache-2.0; see `herdr-app/LICENSE-herdr`.
