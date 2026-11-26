@@ -2,6 +2,8 @@
 
 Prompt-cache state for every Claude Code session running in Herdr, drawn in Herdr's sidebar, plus an optional autocompact that sends `/compact` to big idle sessions just before their cache expires.
 
+![The Herdr Agents sidebar with three Claude sessions: one warm with under a minute left and a nearly empty amber bar, one cold showing what waking it costs, and one warm with 54 minutes left](docs/sidebar-cache.png)
+
 - A bar under each Claude row drains as the cache lifetime runs out; the label turns amber near the end.
 - Under the name: context size, and what the next prompt would cost if the cache went cold.
 - The sidebar header counts warm sessions and what waking the cold ones would cost.
