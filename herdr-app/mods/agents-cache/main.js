@@ -1,10 +1,11 @@
 // Agents in grouped or priority views; parents take their most urgent sub-agent's place.
 // A viewed done agent stays in Done until left.
+// Modified from Herdr's bundled agents mod, licensed Apache-2.0; see herdr-app/LICENSE-herdr.
 // Local copy of the shipped agents mod: Claude rows add their prompt-cache state (warm with time left,
 // cold with what waking costs) from ~/.local/bin/herdr-claude, whose --track also resumes Claude in
-// terminals that lost it. Rows also name the Workwatch workstream the session is on (ws-12, or ws-12?
-// when inferred from the tickets it talks about). Its close_tab / close_pane key commands ask first
-// when anything but an idle shell would end.
+// terminals that lost it. When herdr-claude's optional Workwatch label is on, rows also name the
+// workstream the session is on (ws-12, or ws-12? when inferred from the tickets it talks about).
+// Its close_tab / close_pane key commands ask first when anything but an idle shell would end.
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";

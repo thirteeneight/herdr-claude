@@ -17,6 +17,10 @@ Every 30 seconds the `agents-cache` sidebar mod runs `herdr-claude status --json
 The script finds each Claude session in a Herdr terminal, reads its last request from the transcript, works out the cache lifetime from the cache writes recorded there, and returns JSON the mod draws.
 Costs are list-price estimates from the `PRICES` table at the top of the script, for comparing sessions, not a bill.
 
+An optional workstream label under each Claude row names the Workwatch (`ww`) workstream the session is on.
+It is off by default and needs Workwatch, which is not public yet.
+Turn it on with `{"workwatch": {"enabled": true}}` in `~/.config/herdr-claude/config.json`.
+
 ## Requirements
 
 | Need | Why |
@@ -25,7 +29,6 @@ Costs are list-price estimates from the `PRICES` table at the top of the script,
 | Claude Code sessions started inside Herdr | Only sessions in Herdr terminals show up |
 | `python3` 3.9 or newer | Standard library only |
 | `"promptCacheTtl": "1h"` in Claude Code's `settings.json` | With the default five-minute cache the bar empties almost at once |
-| Optional: Workwatch (`ww`) | Shows the workstream each session belongs to |
 
 ## Install
 
@@ -131,4 +134,7 @@ Sends and skips are logged as JSON lines in `~/.local/state/herdr-claude/autocom
 | `herdr-app/layouts/main-cache.json` | `~/.config/herdr-app/layouts/` |
 | `config/autocompact.json` | `~/.config/herdr-claude/config.json` (with `--autocompact`) |
 
-`herdr-app/` is derived from Herdr's bundled agents mod and main layout, licensed under Apache-2.0; see `herdr-app/LICENSE-herdr`.
+## License
+
+MIT, see `LICENSE`.
+`herdr-app/` is derived from Herdr's bundled agents mod and main layout and stays under Apache-2.0; see `herdr-app/LICENSE-herdr`.
