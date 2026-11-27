@@ -1,6 +1,6 @@
 # herdr-claude
 
-Prompt-cache state for every Claude Code session running in Herdr, drawn in Herdr's sidebar, plus an optional autocompact that sends `/compact` to big idle sessions just before their cache expires.
+Prompt-cache state for every Claude Code session running in Herdr, drawn in Herdr's sidebar, plus a Claude Code status line that shows the same inside each session, and an optional autocompact that sends `/compact` to big idle sessions just before their cache expires.
 
 ![The Herdr Agents sidebar with three Claude sessions: one warm with under a minute left and a nearly empty amber bar, one cold showing what waking it costs, and one warm with 54 minutes left](docs/sidebar-cache.png)
 
@@ -12,6 +12,18 @@ Prompt-cache state for every Claude Code session running in Herdr, drawn in Herd
 A warm session reads its context from cache at a tenth of the input price or less.
 A cold one writes the whole context into the cache again, at twice the input price for a one-hour cache.
 With many sessions open, losing track of which are about to go cold gets expensive.
+
+## What you install
+
+| Piece | What it does | Goes to | Active when |
+|---|---|---|---|
+| `agents-cache` mod and `main-cache` layout | The sidebar above | `~/.config/herdr-app/` | You pick the `main-cache` layout in Herdr |
+| `herdr-claude` | The script the mod calls; also `status`, `autocompact` and `import-tmux` on the command line | `~/.local/bin/` | The mod runs it |
+| `herdr-layout` | Pane layouts for the mod's key commands | `~/.local/bin/` | The mod runs it |
+| `claude-statusline` | Claude Code status line: cost, git, context and cache state. Works without Herdr | `~/.local/bin/` | A Claude profile's `settings.json` points `statusLine` at it |
+| Autocompact config | Turns autocompact on | `~/.config/herdr-claude/config.json` | Only with `./install.sh --autocompact` |
+
+Nothing here edits Claude Code's `settings.json` or Herdr's own config; those changes are listed under [Install](#install) for you or your agent to make.
 
 ## How it works
 
@@ -30,12 +42,38 @@ Turn it on with `{"workwatch": {"enabled": true}}` in `~/.config/herdr-claude/co
 | Herdr on macOS, with `hc` (herdr-core) | Runs the sessions and draws the sidebar. Built against Herdr 0.1.16 |
 | Claude Code sessions started inside Herdr | Only sessions in Herdr terminals show up |
 | `python3` 3.9 or newer | Standard library only |
+| `jq` | The status line only |
 | `"promptCacheTtl": "1h"` in Claude Code's `settings.json` | With the default five-minute cache the bar empties almost at once |
 
 ## Install
 
+### With your agent
+
+You don't need a clone.
+Paste this into Claude Code and it fits the pieces into the setup you already have:
+
+```text
+Set up herdr-claude from https://github.com/thirteeneight/herdr-claude in my existing setup.
+Don't clone the repo. Read its README.md and install.sh first, then fetch only the files listed
+under "Files" from https://raw.githubusercontent.com/thirteeneight/herdr-claude/main/<path>
+and put each where my setup keeps that kind of thing (scripts on my PATH, Herdr mods and layouts
+in my Herdr config). Keep the executable bit on scripts.
+
+- Merge the Claude Code settings from the README into each Claude profile's settings.json I use;
+  never replace the file.
+- If I already have a statusLine, show me both and ask whether to replace, keep or combine them.
+- If my Herdr layout is my own, swap its agents mod for agents-cache instead of switching layouts.
+- Ask me before turning on autocompact. Leave the Workwatch label off.
+- Verify with `herdr-app check` on the mod and `herdr-claude status`, then tell me where each
+  file went so I can update it later.
+```
+
+To update, ask your agent to compare those files with the repo's `main` and refresh the ones that changed.
+
+### By hand
+
 ```bash
-git clone <this repo> && cd herdr-claude
+git clone https://github.com/thirteeneight/herdr-claude && cd herdr-claude
 ./install.sh                # scripts to ~/.local/bin, mod and layout to ~/.config/herdr-app
 ./install.sh --autocompact  # same, and writes the autocompact config if you have none
 ```
@@ -45,11 +83,12 @@ Re-run `./install.sh` after `git pull` to update.
 Then:
 
 1. Pick `main-cache` as your layout in Herdr. It is Herdr's `main` layout with the agents panel swapped for `agents-cache`. If you use your own layout, replace its `agents` mod with `agents-cache`.
-2. Add to `~/.claude/settings.json` (or each profile's), then start new sessions:
+2. Add to `~/.claude/settings.json` (or each profile's), then start new sessions. Leave out `statusLine` if you want to keep your own:
 
     ```json
     "promptCacheTtl": "1h",
-    "autoCompactWindow": 500000
+    "autoCompactWindow": 500000,
+    "statusLine": {"type": "command", "command": "~/.local/bin/claude-statusline"}
     ```
 
 3. Check with `herdr-claude status`: every Claude session in Herdr shows as warm, cold or working.
@@ -69,6 +108,24 @@ If you run identities with `CLAUDE_CONFIG_DIR`, list each with the command that 
 ```
 
 `HERDR_CLAUDE_PROFILES="~/.claude=claude:~/.claude-work=work-claude"` overrides the file, but Herdr only sees it if it is in the environment Herdr starts with.
+
+## Status line
+
+`claude-statusline` puts the cache state at the bottom of each Claude Code session, in or out of Herdr.
+For example:
+
+```text
+$12.40 · Opus 5.5
+➜  api-server git:(main) ✗ (in 1.2k · out 85.3k · cache 21.4M)
+Ctx 250.0k [██████░░░░░░] next turn ~$0.05 · cache warm til 14:32 · compact at next milestone
+```
+
+- Line 1: what the session has cost so far, subagents included, and the model.
+- Line 2: folder, git branch, a cross when there are uncommitted changes, and token totals.
+- Line 3: context size against `autoCompactWindow` (`STATUSLINE_CTX_CAP` overrides it), what the next turn costs while warm, and when the cache expires. It turns amber at 200k and red past 400k.
+- When the cache is cold, line 3 shows what resuming would cost instead.
+
+With `{"workwatch": {"enabled": true}}` in `~/.config/herdr-claude/config.json`, line 1 also names the session's Workwatch workstream.
 
 ## Autocompact
 
@@ -122,7 +179,8 @@ Sends and skips are logged as JSON lines in `~/.local/state/herdr-claude/autocom
 
 ## Limits
 
-- Prices are a hand-kept table; update it when prices change.
+- Prices are hand-kept in two places, `PRICES` in `herdr-claude` and `price` in the status line; update both when prices change.
+- The status line skips Haiku 5.5's higher rate for long prompts, so it underestimates those.
 - The mod is a modified copy of Herdr's own agents panel and doesn't follow Herdr's updates to it.
 - Autocompact can't tell Claude's greyed placeholder from typed text, so it skips a session showing one.
 
@@ -132,7 +190,8 @@ Sends and skips are logged as JSON lines in `~/.local/state/herdr-claude/autocom
 |---|---|
 | `bin/herdr-claude` | `~/.local/bin/` |
 | `bin/herdr-layout` (pane layouts the mod's key commands use) | `~/.local/bin/` |
-| `herdr-app/mods/agents-cache/` | `~/.config/herdr-app/mods/agents-cache/` |
+| `claude/statusline.sh` | `~/.local/bin/claude-statusline` |
+| `herdr-app/mods/agents-cache/main.js`, `mod.json` | `~/.config/herdr-app/mods/agents-cache/` |
 | `herdr-app/layouts/main-cache.json` | `~/.config/herdr-app/layouts/` |
 | `config/autocompact.json` | `~/.config/herdr-claude/config.json` (with `--autocompact`) |
 

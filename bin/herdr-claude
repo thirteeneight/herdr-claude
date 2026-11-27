@@ -38,9 +38,9 @@ RESURRECT_SAVE = HOME / ".tmux/plugins/tmux-resurrect/scripts/save.sh"
 
 # (input, cache read) USD per million tokens; cache writes are 1.25x input (5m) or 2x input (1h).
 PRICES = {
-    "claude-fable-5-1": (10, 1), "claude-fable-5": (10, 1),
+    "claude-fable-5-2": (8, 0.2), "claude-fable-5-1": (10, 0.25), "claude-fable-5": (10, 1),
     "claude-opus-5-5": (4, 0.2), "claude-opus-5": (5, 0.5), "claude-opus-4-8": (5, 0.5),
-    "claude-sonnet-5-5": (2, 0.2), "claude-sonnet-5": (2, 0.2), "claude-sonnet-4-6": (3, 0.3),
+    "claude-sonnet-5-5": (2, 0.1), "claude-sonnet-5": (2, 0.2), "claude-sonnet-4-6": (3, 0.3),
     "claude-haiku-5-5": (0.1, 0.01), "claude-haiku-4-5": (1, 0.1),
 }
 LONG_PRICES = {"claude-haiku-5-5": (100_000, (0.5, 0.05))}  # prompt above N tokens uses the long tier
