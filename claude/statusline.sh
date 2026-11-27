@@ -33,7 +33,7 @@ read -r model_id cache_warm cache_exp cache_ttl recache < <(echo "$input" | jq -
   (if .prompt_cache.warm == null then "-" else (.prompt_cache.warm | tostring) end),
   (.prompt_cache.expires_at // "-"), (.prompt_cache.ttl // "-"),
   (.prompt_cache.recache_tokens_if_cold // "-")] | map(tostring) | @tsv')
-# Bar spans the autoCompactWindow set in settings.json.
+# Bar spans 500k tokens, the recommended autoCompactWindow; STATUSLINE_CTX_CAP changes it.
 ctx_cap=${STATUSLINE_CTX_CAP:-500000}
 
 # [input, output, cache read] USD per million tokens; keep in step with PRICES in herdr-claude.

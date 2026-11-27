@@ -23,6 +23,7 @@ With many sessions open, losing track of which are about to go cold gets expensi
 | `claude-statusline` | Claude Code status line: cost, git, context and cache state. Works without Herdr | `~/.local/bin/` | A Claude profile's `settings.json` points `statusLine` at it |
 | Autocompact config | Turns autocompact on | `~/.config/herdr-claude/config.json` | Only with `./install.sh --autocompact` |
 
+The mod runs `herdr-claude` and `herdr-layout` from `~/.local/bin` by full path, not from `PATH`, so keep them there.
 Nothing here edits Claude Code's `settings.json` or Herdr's own config; those changes are listed under [Install](#install) for you or your agent to make.
 
 ## How it works
@@ -55,9 +56,10 @@ Paste this into Claude Code and it fits the pieces into the setup you already ha
 ```text
 Set up herdr-claude from https://github.com/thirteeneight/herdr-claude in my existing setup.
 Don't clone the repo. Read its README.md and install.sh first, then fetch only the files listed
-under "Files" from https://raw.githubusercontent.com/thirteeneight/herdr-claude/main/<path>
-and put each where my setup keeps that kind of thing (scripts on my PATH, Herdr mods and layouts
-in my Herdr config). Keep the executable bit on scripts.
+under "Files" from https://raw.githubusercontent.com/thirteeneight/herdr-claude/main/<path>.
+Put herdr-claude and herdr-layout in ~/.local/bin, because the mod runs them from there.
+Put the status line, mod and layout where my setup keeps that kind of thing, and point
+statusLine.command at wherever claude-statusline ends up. Keep the executable bit on scripts.
 
 - Merge the Claude Code settings from the README into each Claude profile's settings.json I use;
   never replace the file.
@@ -122,7 +124,7 @@ Ctx 250.0k [██████░░░░░░] next turn ~$0.05 · cache warm
 
 - Line 1: what the session has cost so far, subagents included, and the model.
 - Line 2: folder, git branch, a cross when there are uncommitted changes, and token totals.
-- Line 3: context size against `autoCompactWindow` (`STATUSLINE_CTX_CAP` overrides it), what the next turn costs while warm, and when the cache expires. It turns amber at 200k and red past 400k.
+- Line 3: context size against a bar spanning 500k tokens (the recommended `autoCompactWindow`; `STATUSLINE_CTX_CAP` changes it), what the next turn costs while warm, and when the cache expires. It turns amber at 200k and red past 400k.
 - When the cache is cold, line 3 shows what resuming would cost instead.
 
 With `{"workwatch": {"enabled": true}}` in `~/.config/herdr-claude/config.json`, line 1 also names the session's Workwatch workstream.
